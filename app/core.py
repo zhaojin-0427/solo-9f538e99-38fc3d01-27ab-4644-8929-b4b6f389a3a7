@@ -138,8 +138,15 @@ def sweep_segments(repaves, inspects, lo, hi):
 
     repaves:  可迭代的 (start, end, completed_at)
     inspects: 可迭代的 (start, end, measured_at, device_id, run_id)
-    返回合并后的段列表 [(start, end, threshold, frozenset{(device, run)})],
-    其中只保留 measured_at > threshold 的有效 (设备, 跑次)。
+    返回合并后的段列表 [(start, end, threshold, device_count, d1, r1, d2, r2)]:
+    段内 最近一次重铺完工时刻(threshold, 无重铺为 0) 与有效 (设备, 跑次) 集合
+    恒定; d1/d2 为按设备号排序前两台有有效跑次的设备(不足则 None), r1/r2 为
+    该设备最小的有效跑次号, 且这些跑次都覆盖整段。
+
+    有效 (设备, 跑次) 集合按端点事件增量维护(堆 + 懒删除), 每个端点 O(log)
+    更新, 每个原子段只提取 O(设备数) 的展示状态, 不为每个原子段物化跑次集合:
+    内存 O(记录数), 时间 O(记录数 · log 记录数)。2 万条逐条嵌套的重叠记录
+    (原子段数 × 每段跑次数 = 平方级)也不会撑爆内存。
     """
     # 每个端点位置: (重铺进入, 重铺离开, 检测进入, 检测离开)
     events = defaultdict(lambda: ([], [], [], []))
@@ -155,12 +162,22 @@ def sweep_segments(repaves, inspects, lo, hi):
         if s < e:
             events[s][2].append((d, r, t))
             events[e][3].append((d, r, t))
-    events.setdefault(lo)
-    events.setdefault(hi)
+    events[lo]  # 端点哨兵: 保证扫描覆盖整个 [lo, hi)
+    events[hi]
 
     rep_active = {}   # completed_at -> 覆盖次数
     rep_heap = []     # 最大堆(存负值), 懒删除
-    insp_active = {}  # (device, run, measured_at) -> 覆盖次数
+    thr = 0           # 当前最近一次重铺完工时刻(无活动重铺为 0)
+
+    tcount = {}              # (device, run) -> {measured_at: 覆盖次数}
+    theap = {}               # (device, run) -> measured_at 最大堆(存负值), 懒删除
+    valid = set()            # 当前有效 (device, run): 有活动记录且 measured_at > thr
+    valid_runs = defaultdict(set)   # device -> 有效跑次号集合
+    run_heap = defaultdict(list)    # device -> 跑次号最小堆, 懒删除
+    dev_valid = set()        # 有有效跑次的设备
+    dev_token = {}           # device -> 当前有效代次(失效再生效时递增)
+    dev_heap = []            # (device, 代次) 最小堆, 过期代次懒删除
+    changed = True  # 上一端点处 (threshold, 有效跑次集合) 是否发生变化
 
     def bump(cnt, key, delta):
         v = cnt.get(key, 0) + delta
@@ -169,58 +186,139 @@ def sweep_segments(repaves, inspects, lo, hi):
         else:
             cnt.pop(key, None)
 
-    atomics = []
+    def max_t(key):
+        """该 (设备, 跑次) 活动记录的最大检测时刻; 无活动记录为 None。"""
+        h = theap.get(key)
+        if not h:
+            return None
+        tc = tcount[key]
+        while h:
+            t = -h[0]
+            if tc.get(t, 0) > 0:
+                return t
+            heapq.heappop(h)
+        return None
+
+    def set_valid(d, r, now):
+        """按当前 thr 更新一个 (设备, 跑次) 的有效性, 同步派生结构。"""
+        nonlocal changed
+        if now == ((d, r) in valid):
+            return
+        changed = True
+        if now:
+            valid.add((d, r))
+            runs = valid_runs[d]
+            if not runs:
+                dev_valid.add(d)
+                dev_token[d] = dev_token.get(d, 0) + 1
+                heapq.heappush(dev_heap, (d, dev_token[d]))
+            runs.add(r)
+            heapq.heappush(run_heap[d], r)
+        else:
+            valid.discard((d, r))
+            runs = valid_runs[d]
+            runs.discard(r)
+            if not runs:
+                dev_valid.discard(d)
+
+    def refresh(d, r):
+        m = max_t((d, r))
+        set_valid(d, r, m is not None and m > thr)
+
+    def clean_dev_top():
+        """弹出已失效或已过期的设备堆顶(懒删除)。"""
+        while dev_heap:
+            d, tok = dev_heap[0]
+            if d in dev_valid and dev_token.get(d) == tok:
+                break
+            heapq.heappop(dev_heap)
+
+    def min_run(d):
+        """设备 d 最小的有效跑次号, 堆顶懒删除。"""
+        h, vr = run_heap[d], valid_runs[d]
+        while h and h[0] not in vr:
+            heapq.heappop(h)
+        return h[0] if h else None
+
+    merged = []
+    open_seg = None   # [start, threshold, device_count, d1, r1, d2, r2]
     prev = None
     for pos in sorted(events):
         if prev is not None and pos > prev:
-            thr = 0
-            while rep_heap:
-                top = -rep_heap[0]
-                if rep_active.get(top, 0) > 0:
-                    thr = top
-                    break
-                heapq.heappop(rep_heap)
-            pairs = frozenset(
-                (d, r) for (d, r, t) in insp_active if t > thr
-            )
-            atomics.append((prev, pos, thr, pairs))
+            if open_seg is not None and not changed:
+                pass  # (threshold, 有效跑次集合) 与上一原子段相同, 延伸当前段
+            else:
+                if open_seg is not None:
+                    merged.append((open_seg[0], prev, *open_seg[1:]))
+                clean_dev_top()
+                d1 = dev_heap[0][0] if dev_heap else None
+                d2 = None
+                if d1 is not None:
+                    top1 = heapq.heappop(dev_heap)  # 临时取下 d1 看次小设备
+                    clean_dev_top()
+                    d2 = dev_heap[0][0] if dev_heap else None
+                    heapq.heappush(dev_heap, top1)  # 放回, 供后续原子段使用
+                open_seg = [
+                    prev, thr, len(dev_valid), d1,
+                    min_run(d1) if d1 is not None else None,
+                    d2,
+                    min_run(d2) if d2 is not None else None,
+                ]
+        # 处理 pos 处事件
+        changed = False
         r_add, r_del, i_add, i_del = events[pos]
         for t in r_del:
             bump(rep_active, t, -1)
         for t in r_add:
             bump(rep_active, t, 1)
             heapq.heappush(rep_heap, -t)
-        for k in i_del:
-            bump(insp_active, k, -1)
-        for k in i_add:
-            bump(insp_active, k, 1)
+        new_thr = 0
+        while rep_heap:
+            top = -rep_heap[0]
+            if rep_active.get(top, 0) > 0:
+                new_thr = top
+                break
+            heapq.heappop(rep_heap)
+        if new_thr != thr:
+            thr = new_thr
+            changed = True
+            for d, r in list(tcount):
+                refresh(d, r)
+        # 检测记录进出: 先更新计数, 再对涉及的 (设备, 跑次) 统一重判;
+        # 同一端点先离后进的同一跑次净效果为零, 不会误切段
+        touched = set()
+        for d, r, t in i_del:
+            key = (d, r)
+            tc = tcount[key]
+            v = tc.get(t, 0) - 1
+            if v > 0:
+                tc[t] = v
+            else:
+                del tc[t]
+                if not tc:
+                    del tcount[key]
+                    theap.pop(key, None)
+            touched.add(key)
+        for d, r, t in i_add:
+            key = (d, r)
+            tc = tcount.setdefault(key, {})
+            tc[t] = tc.get(t, 0) + 1
+            heapq.heappush(theap.setdefault(key, []), -t)
+            touched.add(key)
+        for d, r in touched:
+            refresh(d, r)
         prev = pos
-
-    # 相邻且状态相同的原子段合并; 合并后段内每个有效 (设备, 跑次) 都覆盖整段
-    merged = []
-    for s, e, thr, pairs in atomics:
-        if merged and merged[-1][1] == s and merged[-1][2] == thr and merged[-1][3] == pairs:
-            merged[-1] = (merged[-1][0], e, thr, pairs)
-        else:
-            merged.append((s, e, thr, pairs))
+    if open_seg is not None:
+        merged.append((open_seg[0], prev, *open_seg[1:]))
     return merged
 
 
 def segment_rows(lane, merged):
     """把扫描结果转成 acceptance 表行。"""
-    out = []
-    for s, e, thr, pairs in merged:
-        devs = sorted({d for d, _ in pairs})
-        shown = []
-        for d in devs[:NEEDED_DEVICES]:
-            run = min(r for dd, r in pairs if dd == d)
-            shown.append((d, run))
-        d1, r1 = shown[0] if len(shown) > 0 else (None, None)
-        d2, r2 = shown[1] if len(shown) > 1 else (None, None)
-        count = len(devs)
-        missing = max(0, NEEDED_DEVICES - count)
-        out.append((lane, s, e, thr, count, missing, d1, r1, d2, r2))
-    return out
+    return [
+        (lane, s, e, thr, count, max(0, NEEDED_DEVICES - count), d1, r1, d2, r2)
+        for s, e, thr, count, d1, r1, d2, r2 in merged
+    ]
 
 
 # ---------------------------------------------------------------- 交验结果落库

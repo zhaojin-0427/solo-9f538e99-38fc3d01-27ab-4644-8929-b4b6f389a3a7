@@ -22,6 +22,10 @@ docker compose up --build
 访问 http://localhost:8000 。SQLite 数据库保存在命名卷 `acceptance-data`
 (容器内 `/data/acceptance.db`), 重启后交验结果仍可查询。
 
+镜像内置 `MALLOC_ARENA_MAX=1`(限制 glibc 分配 arena 的虚拟地址空间预留),
+配合应用内 1 MiB 线程栈设置, 即使进程地址空间被限制在 256 MiB
+(如 `ulimit -v` / RLIMIT_AS), 2 万条重叠记录的整批更正也能在 20 秒内提交成功。
+
 ### 本地开发
 
 ```bash
@@ -76,10 +80,15 @@ start_m,end_m,measured_at,device_id,run_id
 ## 计算方式(不逐米展开)
 
 - 采用**扫描线算法**: 只以所有区间的端点为事件点切分原子段,
-  复杂度 O((记录数) · log + 活跃区间), 与里程长度无关;
-  相邻且状态(重铺完工时刻 + 有效设备跑次集合)相同的原子段合并,
+  复杂度 O(记录数 · log 记录数), 与里程长度无关。
+- 有效 (设备, 跑次) 集合按事件点**增量维护**(堆 + 懒删除), 每个原子段只
+  提取 O(设备数) 的展示状态(缺几台、前两台设备及其最小有效跑次),
+  不为每个原子段物化跑次集合 —— 内存 O(记录数)。2 万条逐条嵌套的重叠
+  记录(原子段数 × 每段跑次数为平方级)在 256 MiB 地址空间下也能算完
+  (见 `scripts/nested_correction_check.py`, 可复测)。
+- 相邻且状态(重铺完工时刻 + 有效设备跑次集合)相同的原子段合并,
   因此列出的每台设备的跑次必然覆盖整个结果段。
-- 每车道 20 万条记录下: 1 万行批次上传约 1 秒, 局部整批更正约 0.15 秒
+- 每车道 20 万条记录下: 1 万行批次上传约 1 秒, 局部整批更正约 0.2 秒
   (见 `scripts/perf_check.py`, 可复测)。
 - 更正时交验状态是逐点函数(只取决于覆盖该点的记录), 所以只需重算
   旧批和新批涉及的米段组件; 组件外的既有结果行原样保留。
@@ -101,8 +110,12 @@ start_m,end_m,measured_at,device_id,run_id
 
 ```bash
 pip install -r requirements-dev.txt
-pytest tests/ -q            # 15 个用例: 规则、整批更正、失败回滚、重启持久化等
+pytest tests/ -q            # 18 个用例: 规则、整批更正、失败回滚、重启持久化、
+                            # 嵌套重叠、与逐米暴力法/原始实现对拍等
 python scripts/perf_check.py   # 20 万条/车道的录入、更正、查询耗时
+python scripts/nested_correction_check.py   # 2 万条逐条嵌套重叠记录的整批更正
+# 模拟 256 MiB 地址空间限制复测更正场景:
+bash -c 'ulimit -v 262144; python scripts/nested_correction_check.py'
 ```
 
 ## 目录结构
@@ -116,5 +129,6 @@ app/
 tests/test_app.py
 scripts/gen_sample.py   生成演示 CSV
 scripts/perf_check.py   20 万条性能验证
+scripts/nested_correction_check.py   2 万条嵌套重叠记录更正回归验证
 Dockerfile / docker-compose.yml
 ```

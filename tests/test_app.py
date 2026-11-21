@@ -4,7 +4,9 @@
 """
 from __future__ import annotations
 
+import heapq
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import pytest
@@ -13,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fastapi.testclient import TestClient
 
-from app.core import merge_ranges, sweep_segments
+from app.core import merge_ranges, segment_rows, sweep_segments
 
 
 @pytest.fixture()
@@ -226,7 +228,7 @@ def test_sweep_no_per_meter_expansion():
     repaves = [(0, 10**9, 50)]
     inspects = [(0, 10**9, 100, "A", "R1"), (0, 10**9, 101, "B", "R1")]
     out = sweep_segments(repaves, inspects, 0, 10**9)
-    assert out == [(0, 10**9, 50, frozenset({("A", "R1"), ("B", "R1")}))]
+    assert out == [(0, 10**9, 50, 2, "A", "R1", "B", "R1")]
 
 
 def test_sweep_merges_adjacent_identical():
@@ -239,3 +241,176 @@ def test_sweep_merges_adjacent_identical():
 def test_merge_ranges():
     assert merge_ranges([(5, 8), (0, 3), (3, 5), (20, 25)]) == [(0, 8), (20, 25)]
     assert merge_ranges([]) == []
+
+
+# ------------------------------------------------------------ 扫描算法: 嵌套重叠与对拍
+
+def _bruteforce_meters(repaves, inspects, lo, hi):
+    """逐米暴力计算展示状态(真值): 每米 (threshold, count, d1, r1, d2, r2)。"""
+    out = []
+    for m in range(lo, hi):
+        thr = max([t for s, e, t in repaves if s <= m < e] or [0])
+        pairs = {(d, r) for s, e, t, d, r in inspects if s <= m < e and t > thr}
+        devs = sorted({d for d, _ in pairs})
+        shown = [(d, min(r for dd, r in pairs if dd == d)) for d in devs[:2]]
+        d1, r1 = shown[0] if len(shown) > 0 else (None, None)
+        d2, r2 = shown[1] if len(shown) > 1 else (None, None)
+        out.append((thr, len(devs), d1, r1, d2, r2))
+    return out
+
+
+def _expand(merged):
+    """把扫描结果逐米展开, 便于与暴力法对比。"""
+    out = []
+    for s, e, thr, count, d1, r1, d2, r2 in merged:
+        out.extend([(thr, count, d1, r1, d2, r2)] * (e - s))
+    return out
+
+
+def _assert_run_covers(merged, inspects):
+    """列出的跑次须覆盖整段: 段内每一点都有该跑次 measured_at > threshold 的记录。"""
+    for s, e, thr, count, d1, r1, d2, r2 in merged:
+        for d, r in ((d1, r1), (d2, r2)):
+            if d is None:
+                continue
+            covered = merge_ranges(
+                [(max(ds, s), min(de, e)) for ds, de, dt, dd, dr in inspects
+                 if dd == d and dr == r and dt > thr]
+            )
+            assert covered == [(s, e)], (s, e, d, r)
+
+
+def _reference_rows(lane, repaves, inspects, lo, hi):
+    """修复前的原始实现(逐原子段物化跑次集合), 作为分段/去重/跑次选择规则的参照。"""
+    def bump(cnt, key, delta):
+        v = cnt.get(key, 0) + delta
+        if v:
+            cnt[key] = v
+        else:
+            cnt.pop(key, None)
+
+    events = defaultdict(lambda: ([], [], [], []))
+    for s, e, t in repaves:
+        s, e = max(s, lo), min(e, hi)
+        if s < e:
+            events[s][0].append(t)
+            events[e][1].append(t)
+    for s, e, t, d, r in inspects:
+        s, e = max(s, lo), min(e, hi)
+        if s < e:
+            events[s][2].append((d, r, t))
+            events[e][3].append((d, r, t))
+    events[lo]
+    events[hi]
+    rep_active, rep_heap, insp_active = {}, [], {}
+    atomics, prev = [], None
+    for pos in sorted(events):
+        if prev is not None and pos > prev:
+            thr = 0
+            while rep_heap:
+                top = -rep_heap[0]
+                if rep_active.get(top, 0) > 0:
+                    thr = top
+                    break
+                heapq.heappop(rep_heap)
+            atomics.append((prev, pos, thr, frozenset(
+                (d, r) for (d, r, t) in insp_active if t > thr)))
+        r_add, r_del, i_add, i_del = events[pos]
+        for t in r_del:
+            bump(rep_active, t, -1)
+        for t in r_add:
+            bump(rep_active, t, 1)
+            heapq.heappush(rep_heap, -t)
+        for k in i_del:
+            bump(insp_active, k, -1)
+        for k in i_add:
+            bump(insp_active, k, 1)
+        prev = pos
+    merged = []
+    for s, e, thr, pairs in atomics:
+        if merged and merged[-1][1] == s and merged[-1][2] == thr and merged[-1][3] == pairs:
+            merged[-1] = (merged[-1][0], e, thr, pairs)
+        else:
+            merged.append((s, e, thr, pairs))
+    out = []
+    for s, e, thr, pairs in merged:
+        devs = sorted({d for d, _ in pairs})
+        shown = [(d, min(r for dd, r in pairs if dd == d)) for d in devs[:2]]
+        d1, r1 = shown[0] if len(shown) > 0 else (None, None)
+        d2, r2 = shown[1] if len(shown) > 1 else (None, None)
+        out.append((lane, s, e, thr, len(devs), max(0, 2 - len(devs)), d1, r1, d2, r2))
+    return out
+
+
+def test_sweep_nested_overlapping():
+    # 逐条嵌套、两端各错开 1 米的重叠区间: 原子段数 x 每段跑次数为平方级,
+    # 旧实现在此物化每个原子段的跑次集合会内存爆炸; 新实现只保留展示状态
+    n = 600
+    repaves = [(n // 2, 3 * n // 2, 1000)]
+    inspects = [
+        (i, 2 * n - i, 900 if i % 2 else 1100, "DEV-A" if i % 3 else "DEV-B", f"RUN-{i}")
+        for i in range(n)
+    ]
+    merged = sweep_segments(repaves, inspects, 0, 2 * n)
+    assert _expand(merged) == _bruteforce_meters(repaves, inspects, 0, 2 * n)
+    # 分段/跑次选择与原始实现逐段一致
+    assert segment_rows("L", merged) == _reference_rows("L", repaves, inspects, 0, 2 * n)
+    _assert_run_covers(merged, inspects)
+
+
+def test_sweep_matches_bruteforce_fuzz():
+    # 随机小区间: 与逐米暴力法对拍, 并与原始实现逐段对拍
+    # (含重铺前后、同设备多跑次、端点重合、同跑次首尾相接)
+    import random
+
+    rng = random.Random(20261121)
+    for case in range(300):
+        hi = rng.randint(1, 30)
+        repaves = []
+        for _ in range(rng.randint(0, 3)):
+            s = rng.randint(0, hi - 1)
+            repaves.append((s, rng.randint(s + 1, hi), rng.randint(0, 6)))
+        inspects = []
+        for _ in range(rng.randint(0, 12)):
+            s = rng.randint(0, hi - 1)
+            inspects.append((
+                s, rng.randint(s + 1, hi), rng.randint(0, 6),
+                rng.choice(["A", "B", "C"]), rng.choice(["R1", "R2", "R3"]),
+            ))
+        merged = sweep_segments(repaves, inspects, 0, hi)
+        assert _expand(merged) == _bruteforce_meters(repaves, inspects, 0, hi), case
+        assert segment_rows("L", merged) == _reference_rows("L", repaves, inspects, 0, hi), case
+        _assert_run_covers(merged, inspects)
+
+
+def test_correction_nested_overlapping_e2e(client):
+    # 端到端: 逐条嵌套的重叠检测批, 按原批号更正; 旧区段按剩余记录重新判定
+    n = 2000
+    rep_t = 1000
+    upload(client, "repave", "L1", "RP1", REPAVE_H + f"{n // 2},{3 * n // 2},{rep_t}\n")
+
+    def batch_csv(offset, before_t, after_t):
+        lines = []
+        for i in range(n):
+            dev = "DEV-A" if i % 2 == 0 else "DEV-B"
+            t = before_t if i < n // 2 else after_t
+            lines.append(f"{i + offset},{2 * n - i + offset},{t},{dev},RUN-{i:05d}")
+        return INSPECT_H + "\n".join(lines) + "\n"
+
+    upload(client, "inspect", "L1", "B1", batch_csv(0, rep_t - 10, rep_t + 10))
+    out = segs(client, "L1", 0, 2 * n)
+    assert out  # 重铺区段内: 完工前跑次无效, 完工后跑次(两台设备)有效
+    mid = [s for s in out if s["start_m"] <= 3 * n // 4 < s["end_m"]][0]
+    assert mid["threshold"] == rep_t and mid["qualified"]
+
+    # 更正: 整体右移 2n 米 -> 旧区段不再被新批覆盖, 按剩余记录重新判定
+    upload(client, "inspect", "L1", "B1", batch_csv(2 * n, rep_t - 10, rep_t + 10))
+    assert segs(client, "L1", 0, n // 2) == []      # 旧区段已无任何记录 -> 无结果行
+    hole = segs(client, "L1", n // 2, 3 * n // 2)   # 旧区段只剩重铺 -> 重新判定为缺 2 台
+    assert hole and all(s["missing"] == 2 and s["threshold"] == rep_t for s in hole)
+    out = segs(client, "L1", 2 * n, 4 * n)          # 新批区段(无重铺)合格
+    mid = [s for s in out if s["start_m"] <= 3 * n < s["end_m"]][0]
+    assert mid["qualified"] and mid["threshold"] == 0
+    batches = {b["batch_no"]: b["row_count"]
+               for b in client.get("/api/batches").json()["batches"]}
+    assert batches["B1"] == n

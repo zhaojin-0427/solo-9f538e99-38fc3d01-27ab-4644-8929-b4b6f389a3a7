@@ -26,6 +26,10 @@ from .db import get_conn, init_db
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # 单次上传上限
 RESULT_LIMIT = 5000                   # 单次查询最多返回段数
 
+# 工作线程栈调小(默认 8MiB/线程的虚拟地址空间开销): 地址空间受限
+# (如 256MiB) 时, 线程池也不至于耗尽虚拟内存; 请求处理调用栈很浅, 1MiB 足够
+threading.stack_size(1024 * 1024)
+
 UPLOAD_LOCK = threading.Lock()  # 单进程内串行化写入; 多进程由 BEGIN IMMEDIATE 兜底
 
 KIND_NAMES = {"repave": "重铺", "inspect": "检测"}
